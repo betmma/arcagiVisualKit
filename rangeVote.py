@@ -18,7 +18,7 @@ if str(ROOT) not in sys.path:
 
 from puzzle.evaluator import ArcPuzzleEvaluator
 from puzzle.evaluator import ARC_PALETTE
-from veo3 import generate_video_output_multiple_tries, generate_video_outputs_multiprocess
+from api import generate_video_output_multiple_tries, generate_video_outputs_multiprocess
 from gpt5 import generate_multiple_tries as generate_gpt5_multiple_tries, generate_outputs_multiprocess
 
 GPT5_PROMPT = "Each row contains input and output grids. Learn the pattern and generate the output grid for the last input. Color palette: 0: black\n1: blue\n2: red\n3: green\n4: yellow\n5: gray\n6: magenta\n7: orange\n8: cyan\n9: brown. Output a row-major 2d array representing the output grid, with each element an integer from 0 to 9."

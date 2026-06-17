@@ -1,0 +1,431 @@
+#!/usr/bin/env python3
+"""Send ARC-AGI visual puzzles to a local OpenAI-compatible vLLM server.
+
+Each request is built from one record in data/arcagi/data.json and contains the
+record prompt plus the corresponding puzzle image. Every response gets its own
+timestamped directory under output/.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import time
+from dataclasses import asdict, dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Iterable, Optional
+
+import requests
+
+
+DEFAULT_BASE_URL = "http://127.0.0.1:8000/v1"
+DEFAULT_MODEL = "Qwen3.5"
+DEFAULT_METADATA = Path("data/arcagi/data.json")
+DEFAULT_OUTPUT_ROOT = Path("output")
+
+
+@dataclass
+class VllmArcagiConfig:
+    base_url: str = DEFAULT_BASE_URL
+    model: str = DEFAULT_MODEL
+    output_root: str = str(DEFAULT_OUTPUT_ROOT)
+    timeout: int = 600
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    max_tokens: Optional[int] = None
+    stream: bool = False
+    request_retries: int = 1
+    retry_delay: float = 0.0
+    api_key: str = ""
+    no_proxy: bool = True
+
+
+def write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def image_mime_type(image_path: Path) -> str:
+    ext = image_path.suffix.lower()
+    if ext in (".jpg", ".jpeg"):
+        return "image/jpeg"
+    if ext == ".webp":
+        return "image/webp"
+    return "image/png"
+
+
+def image_to_data_url(image_path: Path) -> str:
+    encoded = base64.b64encode(image_path.read_bytes()).decode("utf-8")
+    return f"data:{image_mime_type(image_path)};base64,{encoded}"
+
+
+def build_messages(prompt_text: str, image_path: Path) -> list[dict[str, Any]]:
+    return [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt_text},
+                {"type": "image_url", "image_url": {"url": image_to_data_url(image_path)}},
+            ],
+        }
+    ]
+
+
+def create_output_directory(output_root: Path) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+    output_root.mkdir(parents=True, exist_ok=True)
+    candidate = output_root / f"output_{timestamp}"
+    counter = 1
+    while candidate.exists():
+        candidate = output_root / f"output_{timestamp}_{counter:02d}"
+        counter += 1
+    candidate.mkdir(parents=True, exist_ok=False)
+    return candidate
+
+
+def public_config(config: VllmArcagiConfig) -> dict[str, Any]:
+    data = asdict(config)
+    data["api_key"] = "***" if data["api_key"] else ""
+    return data
+
+
+def clean_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in payload.items() if value is not None}
+
+
+def request_with_retries(
+    method: str,
+    url: str,
+    *,
+    attempts: int,
+    retry_delay: float,
+    **kwargs: Any,
+) -> requests.Response:
+    last_error: Optional[BaseException] = None
+    for attempt in range(1, attempts + 1):
+        try:
+            response = requests.request(method, url, proxies={}, **kwargs)
+            response.raise_for_status()
+            return response
+        except requests.RequestException as error:
+            last_error = error
+            if attempt == attempts:
+                break
+            if retry_delay > 0:
+                time.sleep(retry_delay)
+    if last_error is None:
+        raise RuntimeError("Request failed without an exception")
+    raise last_error
+
+
+def read_streaming_response(response: requests.Response, output_dir: Path) -> dict[str, Any]:
+    full_content = ""
+    chunks: list[dict[str, Any]] = []
+    for line in response.iter_lines():
+        if not line:
+            continue
+        line_text = line.decode("utf-8")
+        if not line_text.startswith("data: "):
+            continue
+        data_text = line_text[6:]
+        if data_text == "[DONE]":
+            continue
+        try:
+            chunk = json.loads(data_text)
+        except json.JSONDecodeError:
+            continue
+        chunks.append(chunk)
+        choices = chunk.get("choices", [])
+        if choices:
+            delta = choices[0].get("delta", {})
+            full_content += delta.get("content", "") or ""
+    write_json(output_dir / "stream_chunks.json", chunks)
+    return {"choices": [{"message": {"role": "assistant", "content": full_content}}], "stream_chunks": chunks}
+
+
+def extract_response_content(response: Any) -> str:
+    if not isinstance(response, dict):
+        return str(response)
+    choices = response.get("choices", [])
+    if not choices:
+        return ""
+    message = choices[0].get("message", {})
+    content = message.get("content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+        return "\n".join(parts)
+    return str(content)
+
+
+def build_payload(config: VllmArcagiConfig, messages: list[dict[str, Any]]) -> dict[str, Any]:
+    return clean_payload(
+        {
+            "model": config.model,
+            "messages": messages,
+            "stream": config.stream,
+            "temperature": config.temperature,
+            "top_p": config.top_p,
+            "max_tokens": config.max_tokens,
+        }
+    )
+
+
+def call_vllm(config: VllmArcagiConfig, messages: list[dict[str, Any]], output_dir: Path) -> dict[str, Any]:
+    url = f"{config.base_url.rstrip('/')}/chat/completions"
+    headers = {"Content-Type": "application/json"}
+    if config.api_key:
+        headers["Authorization"] = f"Bearer {config.api_key}"
+    payload = build_payload(config, messages)
+    write_json(output_dir / "request_payload.json", payload)
+    response = request_with_retries(
+        "POST",
+        url,
+        attempts=config.request_retries,
+        retry_delay=config.retry_delay,
+        headers=headers,
+        json=payload,
+        timeout=config.timeout,
+        stream=config.stream,
+    )
+    if config.stream:
+        return read_streaming_response(response, output_dir)
+    return response.json()
+
+
+def write_input_text(output_dir: Path, record: dict[str, Any], image_path: Path, prompt_text: str) -> None:
+    puzzle_id = str(record.get("id") or record.get("task_id") or "")
+    lines = [
+        f"Puzzle id: {puzzle_id}",
+        f"Input image path: {image_path.as_posix()}",
+        "",
+        "Prompt:",
+        prompt_text,
+        "",
+    ]
+    write_text(output_dir / "input.txt", "\n".join(lines))
+
+
+def write_metadata(
+    output_dir: Path,
+    config: VllmArcagiConfig,
+    record: dict[str, Any],
+    image_path: Path,
+    prompt_text: str,
+    *,
+    success: bool,
+    content: str = "",
+    error: Optional[str] = None,
+) -> None:
+    artifacts = {
+        "content_path": (output_dir / "content.txt").as_posix(),
+        "original_content_path": (output_dir / "original_content.txt").as_posix(),
+        "response_content_preview_path": (output_dir / "response_content_preview.txt").as_posix(),
+    }
+    metadata = {
+        "success": success,
+        "error": error,
+        "created_at": datetime.now().isoformat(),
+        "record_id": record.get("id"),
+        "task_id": record.get("task_id"),
+        "task_path": record.get("task_path"),
+        "input_images": [image_path.as_posix()],
+        "prompt": prompt_text,
+        "config": public_config(config),
+        "content_length": len(content),
+        "artifacts": artifacts,
+    }
+    write_json(output_dir / "metadata.json", metadata)
+
+
+def save_success_artifacts(
+    output_dir: Path,
+    config: VllmArcagiConfig,
+    record: dict[str, Any],
+    image_path: Path,
+    prompt_text: str,
+    response_payload: dict[str, Any],
+) -> str:
+    content = extract_response_content(response_payload)
+    write_json(output_dir / "raw_api_response.json", response_payload)
+    write_text(output_dir / "response_content_preview.txt", content[:4000])
+    write_text(output_dir / "content.txt", content)
+    write_text(output_dir / "original_content.txt", content)
+    write_metadata(output_dir, config, record, image_path, prompt_text, success=True, content=content)
+    return content
+
+
+def read_metadata(path: Path) -> list[dict[str, Any]]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, list):
+        raise ValueError(f"Metadata must be a list of records: {path}")
+    records: list[dict[str, Any]] = []
+    for index, item in enumerate(payload, start=1):
+        if not isinstance(item, dict):
+            raise ValueError(f"Metadata item {index} is not an object")
+        records.append(item)
+    return records
+
+
+def resolve_image_path(metadata_path: Path, record: dict[str, Any]) -> Path:
+    image_rel = record.get("image")
+    if not isinstance(image_rel, str) or not image_rel:
+        raise ValueError(f"Record {record.get('id')!r} missing image")
+    image_path = (metadata_path.parent / image_rel).resolve()
+    if not image_path.exists():
+        raise FileNotFoundError(f"Puzzle image not found: {image_path}")
+    return image_path
+
+
+def selected_records(
+    records: list[dict[str, Any]],
+    *,
+    start: Optional[int],
+    end: Optional[int],
+    limit: Optional[int],
+    ids: Optional[set[str]],
+) -> Iterable[tuple[int, dict[str, Any]]]:
+    if start is not None and start <= 0:
+        raise ValueError("--start must be a positive 1-based index")
+    if end is not None and end <= 0:
+        raise ValueError("--end must be a positive 1-based index")
+    if start is not None and end is not None and end < start:
+        raise ValueError("--end must be >= --start")
+    start_index = 0 if start is None else start - 1
+    end_index = len(records) if end is None else end
+    emitted = 0
+    for zero_index, record in enumerate(records[start_index:end_index], start=start_index):
+        record_id = str(record.get("id") or record.get("task_id") or "")
+        if ids is not None and record_id not in ids:
+            continue
+        yield zero_index + 1, record
+        emitted += 1
+        if limit is not None and emitted >= limit:
+            break
+
+
+def generate_one(
+    config: VllmArcagiConfig,
+    metadata_path: Path,
+    record: dict[str, Any],
+    *,
+    attempt: int,
+) -> Path:
+    prompt_value = record.get("prompt")
+    if not isinstance(prompt_value, str) or not prompt_value.strip():
+        raise ValueError(f"Record {record.get('id')!r} missing prompt")
+    prompt_text = prompt_value.strip()
+    image_path = resolve_image_path(metadata_path, record)
+    output_dir = create_output_directory(Path(config.output_root))
+    write_input_text(output_dir, record, image_path, prompt_text)
+    messages = build_messages(prompt_text, image_path)
+    write_json(output_dir / "input_messages.json", messages)
+    try:
+        response_payload = call_vllm(config, messages, output_dir)
+        save_success_artifacts(output_dir, config, record, image_path, prompt_text, response_payload)
+    except Exception as error:
+        write_text(output_dir / "raw_api_error.txt", str(error))
+        write_metadata(output_dir, config, record, image_path, prompt_text, success=False, error=str(error))
+        raise
+    write_json(
+        output_dir / "run_record.json",
+        {
+            "record": record,
+            "attempt": attempt,
+            "output_directory": output_dir.as_posix(),
+        },
+    )
+    return output_dir
+
+
+def parse_ids(value: Optional[str]) -> Optional[set[str]]:
+    if value is None:
+        return None
+    ids = {part.strip() for part in value.split(",") if part.strip()}
+    return ids or None
+
+
+def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--metadata", type=Path, default=DEFAULT_METADATA, help="Path to data/arcagi/data.json")
+    parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT, help="Directory where output_* folders are written")
+    parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="OpenAI-compatible vLLM base URL")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help="Model name as exposed by the vLLM server")
+    parser.add_argument("--api-key", default=os.environ.get("VLLM_API_KEY", ""), help="Optional bearer token")
+    parser.add_argument("--timeout", type=int, default=600)
+    parser.add_argument("--temperature", type=float, default=None)
+    parser.add_argument("--top-p", type=float, default=None)
+    parser.add_argument("--max-tokens", type=int, default=None)
+    parser.add_argument("--stream", action="store_true", help="Use streaming responses and save stream_chunks.json")
+    parser.add_argument("--request-retries", type=int, default=1)
+    parser.add_argument("--retry-delay", type=float, default=0.0)
+    parser.add_argument("--start", type=int, default=None, help="1-based start index in metadata, inclusive")
+    parser.add_argument("--end", type=int, default=None, help="1-based end index in metadata, inclusive")
+    parser.add_argument("--limit", type=int, default=None, help="Maximum number of selected records to send")
+    parser.add_argument("--ids", type=str, default=None, help="Comma-separated puzzle ids to send")
+    parser.add_argument("--attempts", type=int, default=1, help="Requests per selected puzzle")
+    parser.add_argument("--delay", type=float, default=0.0, help="Seconds to wait after each request")
+    parser.add_argument("--no-proxy", action=argparse.BooleanOptionalAction, default=True)
+    return parser.parse_args(argv)
+
+
+def main(argv: Optional[list[str]] = None) -> None:
+    args = parse_args(argv)
+    if args.attempts <= 0:
+        raise ValueError("--attempts must be positive")
+    if args.limit is not None and args.limit <= 0:
+        raise ValueError("--limit must be positive")
+    metadata_path = args.metadata.resolve()
+    records = read_metadata(metadata_path)
+    config = VllmArcagiConfig(
+        base_url=args.base_url,
+        model=args.model,
+        output_root=str(args.output_root),
+        timeout=args.timeout,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        max_tokens=args.max_tokens,
+        stream=args.stream,
+        request_retries=args.request_retries,
+        retry_delay=args.retry_delay,
+        api_key=args.api_key,
+        no_proxy=args.no_proxy,
+    )
+    if config.no_proxy:
+        os.environ["NO_PROXY"] = "*"
+
+    ids = parse_ids(args.ids)
+    selected = list(selected_records(records, start=args.start, end=args.end, limit=args.limit, ids=ids))
+    if not selected:
+        raise ValueError("No records selected")
+
+    total_requests = len(selected) * args.attempts
+    completed = 0
+    for attempt in range(1, args.attempts + 1):
+        for metadata_index, record in selected:
+            record_id = record.get("id") or record.get("task_id") or f"index_{metadata_index}"
+            print(f"[{completed + 1}/{total_requests}] sending {record_id} attempt {attempt}")
+            output_dir = generate_one(config, metadata_path, record, attempt=attempt)
+            completed += 1
+            print(f"    wrote {output_dir}")
+            if args.delay > 0 and completed < total_requests:
+                time.sleep(args.delay)
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()
