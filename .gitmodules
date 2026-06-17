@@ -1,0 +1,3 @@
+[submodule "ARC_AGI-2"]
+	path = ARC_AGI-2
+	url = https://github.com/arcprize/ARC-AGI-2
