@@ -399,7 +399,6 @@ def run_tasks_parallel(tasks: list[dict[str, Any]], *, workers: int, delay: floa
             record = task["record"]
             metadata_index = task["metadata_index"]
             record_id = record.get("id") or record.get("task_id") or f"index_{metadata_index}"
-            print(f"[submit {len(future_to_task) + 1}/{total}] {record_id} attempt {task['attempt']}")
             future = executor.submit(generate_task, task)
             future_to_task[future] = task
             if delay > 0 and len(future_to_task) < total:
