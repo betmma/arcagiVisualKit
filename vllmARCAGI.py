@@ -13,6 +13,7 @@ import base64
 import json
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -80,15 +81,17 @@ def build_messages(prompt_text: str, image_path: Path) -> list[dict[str, Any]]:
 
 
 def create_output_directory(output_root: Path) -> Path:
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
     output_root.mkdir(parents=True, exist_ok=True)
-    candidate = output_root / f"output_{timestamp}"
-    counter = 1
-    while candidate.exists():
-        candidate = output_root / f"output_{timestamp}_{counter:02d}"
-        counter += 1
-    candidate.mkdir(parents=True, exist_ok=False)
-    return candidate
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    for counter in range(10000):
+        suffix = "" if counter == 0 else f"_{counter:04d}"
+        candidate = output_root / f"output_{timestamp}{suffix}"
+        try:
+            candidate.mkdir(parents=True, exist_ok=False)
+            return candidate
+        except FileExistsError:
+            continue
+    raise RuntimeError(f"Could not create a unique output directory under {output_root}")
 
 
 def public_config(config: VllmArcagiConfig) -> dict[str, Any]:
@@ -352,6 +355,95 @@ def generate_one(
     return output_dir
 
 
+def generate_task(task: dict[str, Any]) -> tuple[str, int, Path]:
+    config = task["config"]
+    metadata_path = task["metadata_path"]
+    record = task["record"]
+    attempt = task["attempt"]
+    metadata_index = task["metadata_index"]
+    record_id = str(record.get("id") or record.get("task_id") or f"index_{metadata_index}")
+    output_dir = generate_one(config, metadata_path, record, attempt=attempt)
+    return record_id, attempt, output_dir
+
+
+def build_tasks(
+    config: VllmArcagiConfig,
+    metadata_path: Path,
+    selected: list[tuple[int, dict[str, Any]]],
+    attempts: int,
+) -> list[dict[str, Any]]:
+    tasks: list[dict[str, Any]] = []
+    for attempt in range(1, attempts + 1):
+        for metadata_index, record in selected:
+            tasks.append(
+                {
+                    "config": config,
+                    "metadata_path": metadata_path,
+                    "metadata_index": metadata_index,
+                    "record": record,
+                    "attempt": attempt,
+                }
+            )
+    return tasks
+
+
+def run_tasks_parallel(tasks: list[dict[str, Any]], *, workers: int, delay: float) -> list[Path]:
+    total = len(tasks)
+    completed = 0
+    output_dirs: list[Path] = []
+    errors: list[tuple[str, int, BaseException]] = []
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_task = {}
+        for task in tasks:
+            record = task["record"]
+            metadata_index = task["metadata_index"]
+            record_id = record.get("id") or record.get("task_id") or f"index_{metadata_index}"
+            print(f"[submit {len(future_to_task) + 1}/{total}] {record_id} attempt {task['attempt']}")
+            future = executor.submit(generate_task, task)
+            future_to_task[future] = task
+            if delay > 0 and len(future_to_task) < total:
+                time.sleep(delay)
+
+        for future in as_completed(future_to_task):
+            task = future_to_task[future]
+            record = task["record"]
+            metadata_index = task["metadata_index"]
+            record_id = str(record.get("id") or record.get("task_id") or f"index_{metadata_index}")
+            attempt = int(task["attempt"])
+            try:
+                done_record_id, done_attempt, output_dir = future.result()
+                completed += 1
+                output_dirs.append(output_dir)
+                print(f"[done {completed}/{total}] {done_record_id} attempt {done_attempt}: {output_dir}")
+            except Exception as error:
+                completed += 1
+                errors.append((record_id, attempt, error))
+                print(f"[failed {completed}/{total}] {record_id} attempt {attempt}: {error}")
+
+    if errors:
+        summary = "; ".join(f"{record_id} attempt {attempt}: {error}" for record_id, attempt, error in errors[:5])
+        extra = "" if len(errors) <= 5 else f"; plus {len(errors) - 5} more"
+        raise RuntimeError(f"{len(errors)} request(s) failed: {summary}{extra}")
+    return output_dirs
+
+
+def run_tasks_serial(tasks: list[dict[str, Any]], *, delay: float) -> list[Path]:
+    total = len(tasks)
+    output_dirs: list[Path] = []
+    for index, task in enumerate(tasks, start=1):
+        record = task["record"]
+        metadata_index = task["metadata_index"]
+        record_id = record.get("id") or record.get("task_id") or f"index_{metadata_index}"
+        print(f"[{index}/{total}] sending {record_id} attempt {task['attempt']}")
+        _, _, output_dir = generate_task(task)
+        output_dirs.append(output_dir)
+        print(f"    wrote {output_dir}")
+        if delay > 0 and index < total:
+            time.sleep(delay)
+    return output_dirs
+
+
 def parse_ids(value: Optional[str]) -> Optional[set[str]]:
     if value is None:
         return None
@@ -378,7 +470,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=None, help="Maximum number of selected records to send")
     parser.add_argument("--ids", type=str, default=None, help="Comma-separated puzzle ids to send")
     parser.add_argument("--attempts", type=int, default=1, help="Requests per selected puzzle")
-    parser.add_argument("--delay", type=float, default=0.0, help="Seconds to wait after each request")
+    parser.add_argument("--workers", type=int, default=16, help="Parallel request workers. Use 1 for serial execution")
+    parser.add_argument("--delay", type=float, default=0.0, help="Seconds to wait between request submissions")
     parser.add_argument("--no-proxy", action=argparse.BooleanOptionalAction, default=True)
     return parser.parse_args(argv)
 
@@ -387,6 +480,8 @@ def main(argv: Optional[list[str]] = None) -> None:
     args = parse_args(argv)
     if args.attempts <= 0:
         raise ValueError("--attempts must be positive")
+    if args.workers <= 0:
+        raise ValueError("--workers must be positive")
     if args.limit is not None and args.limit <= 0:
         raise ValueError("--limit must be positive")
     metadata_path = args.metadata.resolve()
@@ -413,17 +508,11 @@ def main(argv: Optional[list[str]] = None) -> None:
     if not selected:
         raise ValueError("No records selected")
 
-    total_requests = len(selected) * args.attempts
-    completed = 0
-    for attempt in range(1, args.attempts + 1):
-        for metadata_index, record in selected:
-            record_id = record.get("id") or record.get("task_id") or f"index_{metadata_index}"
-            print(f"[{completed + 1}/{total_requests}] sending {record_id} attempt {attempt}")
-            output_dir = generate_one(config, metadata_path, record, attempt=attempt)
-            completed += 1
-            print(f"    wrote {output_dir}")
-            if args.delay > 0 and completed < total_requests:
-                time.sleep(args.delay)
+    tasks = build_tasks(config, metadata_path, selected, args.attempts)
+    if args.workers == 1:
+        run_tasks_serial(tasks, delay=args.delay)
+    else:
+        run_tasks_parallel(tasks, workers=args.workers, delay=args.delay)
     print("Done.")
 
 
