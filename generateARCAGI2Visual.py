@@ -127,7 +127,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--prompt",
         type=str,
-        default="Each row contains input and output grids. Learn the pattern and generate the output grid for the last input while keeping existing patterns without modification. Static camera perspective, no zoom or pan. In portrait.",
+        default="Each row contains input and output grids. Learn the pattern and generate the output grid for the last input. Color palette: 0: black\n1: blue\n2: red\n3: green\n4: yellow\n5: gray\n6: magenta\n7: orange\n8: cyan\n9: brown. Output a row-major 2d array representing the output grid, with each element an integer from 0 to 9.",#"Each row contains input and output grids. Learn the pattern and generate the output grid for the last input while keeping existing patterns without modification. Static camera perspective, no zoom or pan. In portrait.",
         help="Prompt text stored with each puzzle record",
     )
     parser.add_argument(
