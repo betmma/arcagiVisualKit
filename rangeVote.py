@@ -58,6 +58,10 @@ def _render_grid_to_image(
     draw = ImageDraw.Draw(result_image)
     for row_index, row in enumerate(grid):
         for col_index, value in enumerate(row):
+            try:
+                int(value)
+            except (ValueError,TypeError):
+                value=10
             color = ARC_PALETTE.get(int(value), ARC_PALETTE[0])
             left = x0 + col_index * cell_size
             top = y0 + row_index * cell_size
